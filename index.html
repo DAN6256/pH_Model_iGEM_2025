@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Biocementation pH Model</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/12.4.0/math.js"></script>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+  body{font-family:system-ui,Roboto,Inter,Arial,sans-serif;background:#f8fafc;color:#0f172a;margin:0}
+  header{padding:20px}
+  .wrap{max-width:1100px;margin:0 auto;padding:0 20px 40px}
+  .panel{background:#fff;border:1px solid #e2e8f0;border-radius:12px;box-shadow:0 2px 10px rgba(15,23,42,.05);padding:16px;margin-top:12px}
+
+  .grid{
+    display:grid;
+    grid-template-columns:260px 1fr;
+    gap:16px;
+    align-items:start;
+  }
+
+  .controls{ position:relative; z-index:2; }
+  .charts{ position:relative; z-index:1; overflow:hidden; }
+
+  .control{
+    display:grid;
+    grid-template-columns:120px 1fr 64px;
+    gap:8px; align-items:center; margin:8px 0;
+  }
+  .control label{ font-size:13px; color:#475569; }
+  .control input[type=range]{ width:100%; }
+  .val{
+    text-align:right; font-variant-numeric:tabular-nums;
+    background:#f1f5f9; border:1px solid #e2e8f0; padding:4px 6px; border-radius:8px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+
+  .chart{width:100%; height:420px}
+  .js-plotly-plot .modebar{ right:10px !important; }
+
+  @media (max-width: 980px){
+    .grid{ grid-template-columns:1fr; }
+    .charts{ margin-top:8px; }
+  }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <h1>Urea, Ca²⁺, NH₄⁺(Total), and pH Dynamics</h1>
+  <p>Top: Constant biomass. Bottom: Growing biomass.</p>
+</header>
+
+<main class="wrap panel grid">
+  <!-- Controls -->
+  <div class="controls">
+    <div class="control"><label for="Vmax">Vmax (M/h per OD)</label><input type="range" id="Vmax" min="0.005" max="0.2" step="0.005" value="0.05"><div class="val" id="VmaxVal">0.050</div></div>
+    <div class="control"><label for="Km">Km (M)</label><input type="range" id="Km" min="0.0005" max="0.05" step="0.0005" value="0.005"><div class="val" id="KmVal">0.005</div></div>
+    <div class="control"><label for="kprecip">k<sub>precip</sub> (L/mol·h)</label><input type="range" id="kprecip" min="0" max="2" step="0.05" value="0.5"><div class="val" id="kprecipVal">0.500</div></div>
+    <div class="control"><label for="mu">μ (1/h)</label><input type="range" id="mu" min="0" max="3" step="0.05" value="1.2"><div class="val" id="muVal">1.200</div></div>
+    <div class="control"><label for="B0">B₀ (OD)</label><input type="range" id="B0" min="0.0005" max="0.05" step="0.0005" value="0.005"><div class="val" id="B0Val">0.005</div></div>
+    <div class="control"><label for="Bmax">B<sub>max</sub> (OD)</label><input type="range" id="Bmax" min="0.5" max="10" step="0.5" value="5"><div class="val" id="BmaxVal">5.000</div></div>
+    <div class="control"><label for="U0">U₀ (M, urea)</label><input type="range" id="U0" min="0.05" max="0.6" step="0.01" value="0.30"><div class="val" id="U0Val">0.300</div></div>
+    <div class="control"><label for="Ca0">Ca₀ (M, Ca²⁺)</label><input type="range" id="Ca0" min="0.05" max="0.6" step="0.01" value="0.30"><div class="val" id="Ca0Val">0.300</div></div>
+    <div class="control"><label for="C0">C<sub>tot,0</sub> (M)</label><input type="range" id="C0" min="1e-9" max="1e-5" step="1e-9" value="1e-8"><div class="val" id="C0Val">1.00e-8</div></div>
+    <div class="control"><label for="tend">t<sub>end</sub> (h)</label><input type="range" id="tend" min="10" max="75" step="1" value="50"><div class="val" id="tendVal">50</div></div>
+  </div>
+
+  <!-- Charts -->
+  <div class="charts">
+    <div id="constPlot" class="chart"></div>
+    <div id="growPlot" class="chart"></div>
+  </div>
+</main>
+
+<script>
+  // ===== Chemistry constants (25 °C) =====
+  const Ka_NH4 = 10**(-9.25), Ka1 = 10**(-6.3), Ka2 = 10**(-10.33), Kw = 1e-14, Ksp = 2.8e-9;
+
+  const fmt = x => (Math.abs(x)>=1e-2 && Math.abs(x)<1e3) ? (+x).toFixed(3) : (+x).toExponential(2);
+
+  // --- Charge balance residual ---
+  function chargeResidual(H, Ntot, Ctot, Ca, Cl0) {
+    const denom = H*H + Ka1*H + Ka1*Ka2;
+    const NH4 = Ntot / (1 + Ka_NH4 / H);
+    const HCO3 = Ctot * (Ka1 * H) / denom;
+    const CO3  = Ctot * (Ka1 * Ka2) / denom;
+    const OH   = Kw / H;
+    return (2*Ca + NH4 + H) - (Cl0 + HCO3 + 2*CO3 + OH);
+  }
+
+  // --- Solve [H+] by bisection ---
+  function solveH(Ntot, Ctot, Ca, Cl0) {
+    let Hlo = 1e-12, Hhi = 1e-3;
+    let flo = chargeResidual(Hhi, Ntot, Ctot, Ca, Cl0);
+    let fhi = chargeResidual(Hlo, Ntot, Ctot, Ca, Cl0);
+    if (flo === 0) return Hhi;
+    if (fhi === 0) return Hlo;
+
+    if (flo * fhi > 0) {
+      // Scan grid to find bracket
+      let bestH = Hlo, bestAbs = Math.abs(fhi);
+      for (let i=1;i<=400;i++){
+        const pH = 3 + (12-3)*i/400;
+        const H  = 10**(-pH);
+        const f  = chargeResidual(H, Ntot, Ctot, Ca, Cl0);
+        if (Math.abs(f) < bestAbs) { bestAbs = Math.abs(f); bestH = H; }
+      }
+      return Math.min(Math.max(bestH, 1e-12), 1e-3);
+    }
+
+    let a=Hlo, b=Hhi, fa=fhi, fb=flo;
+    for (let k=0;k<80;k++){
+      const c=0.5*(a+b), fc=chargeResidual(c,Ntot,Ctot,Ca,Cl0);
+      if (Math.abs(fc)<1e-12) return c;
+      if (fa*fc<0){ b=c; fb=fc; } else { a=c; fa=fc; }
+    }
+    return 0.5*(a+b);
+  }
+
+  // --- ODE RHS (closed system) ---
+  function rhsClosed(t, y, P, isGrowing, Cl0) {
+    const U=y[0], N=y[1], C=y[2], Ca=y[3], B=y[4];
+    const rate_urea = P.Vmax * B * U / (P.Km + U);
+    const H = solveH(N, C, Ca, Cl0);
+    const denom = H*H + Ka1*H + Ka1*Ka2;
+    const CO3 = C * (Ka1*Ka2) / denom;
+    const IAP = Ca * CO3;
+    const rate_precip = P.k_precip * Math.max(0, IAP - Ksp);
+    const dU  = -rate_urea;
+    const dN  = +2*rate_urea;
+    const dC  = +rate_urea - rate_precip;
+    const dCa = -rate_precip;
+    let dB = 0;
+    if (isGrowing) dB = P.mu * B * (1 - B/P.B_max);
+    return [dU,dN,dC,dCa,dB,H];
+  }
+
+  // --- RK4 integrator ---
+  function rk4(f,t0,y0,t1,n){
+    const dt=(t1-t0)/n, t=new Array(n+1), y=new Array(n+1); t[0]=t0; y[0]=y0.slice();
+    for (let i=0;i<n;i++){
+      const ti=t[i], yi=y[i];
+      const k1=f(ti,yi), y2=yi.map((v,j)=>v+0.5*dt*k1[j]);
+      const k2=f(ti+0.5*dt,y2), y3=yi.map((v,j)=>v+0.5*dt*k2[j]);
+      const k3=f(ti+0.5*dt,y3), y4=yi.map((v,j)=>v+dt*k3[j]);
+      const k4=f(ti+dt,y4);
+      const yn=yi.map((v,j)=>v+dt*(k1[j]+2*k2[j]+2*k3[j]+k4[j])/6);
+      for (let j=0;j<yn.length;j++) yn[j]=Math.max(0,yn[j]);
+      y[i+1]=yn; t[i+1]=ti+dt;
+    }
+    return {t,y};
+  }
+
+  function simulate(p){
+    const P={Vmax:p.Vmax, Km:p.Km, k_precip:p.k_precip, mu:p.mu, B_max:p.B_max};
+    const U0=p.U0, Ca0=p.Ca0, C0=p.C0, N0=0, B0=p.B0, Cl0=2*Ca0;
+    const y0=[U0,N0,C0,Ca0,B0], n=600, t0=0, t1=p.t_end;
+
+    const f_const=(tt,yy)=>{ const r=rhsClosed(tt,yy,P,false,Cl0); return [r[0],r[1],r[2],r[3],r[4]]; };
+    const f_grow =(tt,yy)=>{ const r=rhsClosed(tt,yy,P,true ,Cl0); return [r[0],r[1],r[2],r[3],r[4]]; };
+
+    const out1=rk4(f_const,t0,y0,t1,n), out2=rk4(f_grow,t0,y0,t1,n);
+
+    function pHseries(t,Y,isGrowing){
+      const arr=new Array(t.length);
+      for (let i=0;i<t.length;i++){ const r=rhsClosed(t[i],Y[i],P,isGrowing,Cl0); arr[i] = -Math.log10(r[5]); }
+      return arr;
+    }
+    return { t:out1.t, Y1:out1.y, Y2:out2.y, pH1:pHseries(out1.t,out1.y,false), pH2:pHseries(out2.t,out2.y,true) };
+  }
+
+  function plotConstant(t, Y, pH) {
+    Plotly.newPlot('constPlot', [
+      { x:t, y:Y.map(r=>r[0]), mode:'lines', name:'Urea (M)', line:{width:2, color:'#16a34a'} },
+      { x:t, y:Y.map(r=>r[3]), mode:'lines', name:'Ca²⁺ (M)', line:{width:2, color:'#06b6d4', dash:'dash'} },
+      { x:t, y:Y.map(r=>r[1]), mode:'lines', name:'NH₄⁺+NH₃ (M)', line:{width:2, color:'#a21caf', dash:'dot'} },
+      { x:t, y:pH,             mode:'lines', name:'pH', yaxis:'y2', line:{width:2, color:'#1d4ed8', dash:'dot'} },
+    ], {
+      title:'Constant Biomass',
+      xaxis:{title:'Time (h)'},
+      yaxis:{title:'Concentration (M)'},
+      yaxis2:{title:'pH', overlaying:'y', side:'right', range:[6.5,9.5]},
+      legend:{orientation:'h'}, margin:{l:60,r:60,t:50,b:50}
+    }, {responsive:true});
+  }
+
+  function plotGrowing(t, Y, pH) {
+    Plotly.newPlot('growPlot', [
+      { x:t, y:Y.map(r=>r[0]), mode:'lines', name:'Urea (M)', line:{width:2, color:'#16a34a'} },
+      { x:t, y:Y.map(r=>r[3]), mode:'lines', name:'Ca²⁺ (M)', line:{width:2, color:'#06b6d4', dash:'dash'} },
+      { x:t, y:Y.map(r=>r[1]), mode:'lines', name:'NH₄⁺+NH₃ (M)', line:{width:2, color:'#a21caf', dash:'dot'} },
+      { x:t, y:pH,             mode:'lines', name:'pH', yaxis:'y2', line:{width:2, color:'#1d4ed8', dash:'dot'} },
+    ], {
+      title:'Growing Biomass',
+      xaxis:{title:'Time (h)'},
+      yaxis:{title:'Concentration (M)'},
+      yaxis2:{title:'pH', overlaying:'y', side:'right', range:[6.5,9.5]},
+      legend:{orientation:'h'}, margin:{l:60,r:60,t:50,b:50}
+    }, {responsive:true});
+  }
+
+  function readP(){
+    return {
+      Vmax:+document.getElementById('Vmax').value,
+      Km:+document.getElementById('Km').value,
+      k_precip:+document.getElementById('kprecip').value,
+      mu:+document.getElementById('mu').value,
+      B0:+document.getElementById('B0').value,
+      B_max:+document.getElementById('Bmax').value,
+      U0:+document.getElementById('U0').value,
+      Ca0:+document.getElementById('Ca0').value,
+      C0:+document.getElementById('C0').value,
+      t_end:+document.getElementById('tend').value,
+    };
+  }
+  function setLabels(p){
+    const set=(id,v)=>document.getElementById(id).textContent=fmt(v);
+    set('VmaxVal',p.Vmax); set('KmVal',p.Km); set('kprecipVal',p.k_precip);
+    set('muVal',p.mu); set('B0Val',p.B0); set('BmaxVal',p.B_max);
+    set('U0Val',p.U0); set('Ca0Val',p.Ca0); set('C0Val',p.C0); set('tendVal',p.t_end);
+  }
+
+  function rerun(){
+    const p = readP(); setLabels(p);
+    const sim = simulate(p);
+    plotConstant(sim.t, sim.Y1, sim.pH1);
+    plotGrowing(sim.t, sim.Y2, sim.pH2);
+  }
+
+  ['Vmax','Km','kprecip','mu','B0','Bmax','U0','Ca0','C0','tend'].forEach(id=>{
+    document.getElementById(id).addEventListener('input', rerun);
+  });
+
+  rerun();
+</script>
+</body>
+</html>
